@@ -22,6 +22,10 @@
 #define MAX31827_TH_HYST_REG	0x8
 #define MAX31827_TL_HYST_REG	0xA
 
+#define MAX31875_CONFIGURATION_REG	0x1
+#define MAX31875_TH_HYST_REG		0x2
+#define MAX31875_TH_REG			0x3
+
 #define MAX31827_CONFIGURATION_1SHOT_MASK	BIT(0)
 #define MAX31827_CONFIGURATION_CNV_RATE_MASK	GENMASK(3, 1)
 #define MAX31827_CONFIGURATION_PEC_EN_MASK	BIT(4)
@@ -32,6 +36,13 @@
 #define MAX31827_CONFIGURATION_FLT_Q_MASK	GENMASK(11, 10)
 #define MAX31827_CONFIGURATION_U_TEMP_STAT_MASK	BIT(14)
 #define MAX31827_CONFIGURATION_O_TEMP_STAT_MASK	BIT(15)
+
+#define MAX31875_CONFIGURATION_CNV_RATE_MASK	GENMASK(2, 1)
+#define MAX31875_CONFIGURATION_PEC_EN_MASK	BIT(3)
+#define MAX31875_CONFIGURATION_TIMEOUT_MASK	BIT(4)
+#define MAX31875_CONFIGURATION_RESOLUTION_MASK	GENMASK(6, 5)
+#define MAX31875_CONFIGURATION_SHUTDOWN_MASK	BIT(8)
+#define MAX31875_CONFIGURATION_FLT_Q_MASK	GENMASK(12, 11)
 
 #define MAX31827_ALRM_POL_LOW	0x0
 #define MAX31827_ALRM_POL_HIGH	0x1
@@ -47,7 +58,11 @@
 #define MAX31827_M_DGR_TO_16_BIT(x)	(((x) << 4) / 1000)
 #define MAX31827_DEVICE_ENABLE(x)	((x) ? 0xA : 0x0)
 
-enum chips { max31827 = 1, max31828, max31829 };
+#define MAX31875_16_BIT_TO_M_DGR(x)	(sign_extend32(x, 15) * 1000 / 256)
+#define MAX31875_M_DGR_TO_16_BIT(x)	(((x) << 8) / 1000)
+#define MAX31875_DEVICE_ENABLE(x)	FIELD_PREP(MAX31875_CONFIGURATION_SHUTDOWN_MASK, !(x))
+
+enum chips { max31827 = 1, max31828, max31829, max31875 };
 
 enum max31827_cnv {
 	MAX31827_CNV_1_DIV_64_HZ = 1,
@@ -95,6 +110,7 @@ struct max31827_state {
 	 * Prevent simultaneous access to the i2c client.
 	 */
 	struct mutex lock;
+	struct device *dev;
 	struct regmap *regmap;
 	bool enable;
 	unsigned int resolution;
@@ -107,12 +123,21 @@ static const struct regmap_config max31827_regmap = {
 	.max_register = 0xA,
 };
 
+static const struct regmap_config max31875_regmap = {
+	.reg_bits = 8,
+	.val_bits = 16,
+	.max_register = 0x3,
+};
+
 static int shutdown_write(struct max31827_state *st, unsigned int reg,
 			  unsigned int mask, unsigned int val)
 {
 	unsigned int cfg;
 	unsigned int cnv_rate;
+	enum chips type;
 	int ret;
+
+	type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
 
 	/*
 	 * Before the Temperature Threshold Alarm, Alarm Hysteresis Threshold
@@ -132,14 +157,24 @@ static int shutdown_write(struct max31827_state *st, unsigned int reg,
 		goto unlock;
 	}
 
-	ret = regmap_read(st->regmap, MAX31827_CONFIGURATION_REG, &cfg);
-	if (ret)
-		goto unlock;
+	/*
+	 * Shutdown Device
+	 */
+	if (type == max31875) {
+		ret = regmap_update_bits(st->regmap, MAX31875_CONFIGURATION_REG,
+				MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+				FIELD_PREP(MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+					   1));
+	} else {
+		ret = regmap_read(st->regmap, MAX31827_CONFIGURATION_REG, &cfg);
+		if (ret)
+			goto unlock;
 
-	cnv_rate = MAX31827_CONFIGURATION_CNV_RATE_MASK & cfg;
-	cfg = cfg & ~(MAX31827_CONFIGURATION_1SHOT_MASK |
-		      MAX31827_CONFIGURATION_CNV_RATE_MASK);
-	ret = regmap_write(st->regmap, MAX31827_CONFIGURATION_REG, cfg);
+		cnv_rate = MAX31827_CONFIGURATION_CNV_RATE_MASK & cfg;
+		cfg = cfg & ~(MAX31827_CONFIGURATION_1SHOT_MASK |
+			MAX31827_CONFIGURATION_CNV_RATE_MASK);
+		ret = regmap_write(st->regmap, MAX31827_CONFIGURATION_REG, cfg);
+	}
 	if (ret)
 		goto unlock;
 
@@ -151,9 +186,19 @@ static int shutdown_write(struct max31827_state *st, unsigned int reg,
 	if (ret)
 		goto unlock;
 
-	ret = regmap_update_bits(st->regmap, MAX31827_CONFIGURATION_REG,
-				 MAX31827_CONFIGURATION_CNV_RATE_MASK,
-				 cnv_rate);
+	/*
+	 * Wake Up Device
+	 */
+	if (type == max31875) {
+		ret = regmap_update_bits(st->regmap, MAX31875_CONFIGURATION_REG,
+				MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+				FIELD_PREP(MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+					   0));
+	} else {
+		ret = regmap_update_bits(st->regmap, MAX31827_CONFIGURATION_REG,
+					MAX31827_CONFIGURATION_CNV_RATE_MASK,
+					cnv_rate);
+	}
 
 unlock:
 	mutex_unlock(&st->lock);
@@ -163,7 +208,14 @@ unlock:
 static int write_alarm_val(struct max31827_state *st, unsigned int reg,
 			   long val)
 {
-	val = MAX31827_M_DGR_TO_16_BIT(val);
+	enum chips type;
+
+	type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
+
+	if (type == max31875)
+		val = MAX31875_M_DGR_TO_16_BIT(val);
+	else
+		val = MAX31827_M_DGR_TO_16_BIT(val);
 
 	return shutdown_write(st, reg, 0, val);
 }
@@ -199,13 +251,31 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long *val)
 {
 	struct max31827_state *st = dev_get_drvdata(dev);
+	enum chips chip_type;
 	unsigned int uval;
 	int ret = 0;
+
+	chip_type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
 
 	switch (type) {
 	case hwmon_temp:
 		switch (attr) {
 		case hwmon_temp_enable:
+			if (chip_type == max31875) {
+				ret = regmap_read(st->regmap,
+						  MAX31875_CONFIGURATION_REG,
+						  &uval);
+				if (ret)
+					break;
+
+				uval = FIELD_GET(MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+						 uval);
+
+				*val = !uval;
+
+				break;
+			}
+
 			ret = regmap_read(st->regmap,
 					  MAX31827_CONFIGURATION_REG, &uval);
 			if (ret)
@@ -227,10 +297,16 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 				 * be changed during the conversion process.
 				 */
 
-				ret = regmap_update_bits(st->regmap,
-							 MAX31827_CONFIGURATION_REG,
-							 MAX31827_CONFIGURATION_1SHOT_MASK,
-							 1);
+				if (chip_type == max31875)
+					ret = regmap_update_bits(st->regmap,
+						MAX31875_CONFIGURATION_REG,
+						MAX31827_CONFIGURATION_1SHOT_MASK,
+						1);
+				else
+					ret = regmap_update_bits(st->regmap,
+						MAX31827_CONFIGURATION_REG,
+						MAX31827_CONFIGURATION_1SHOT_MASK,
+						1);
 				if (ret) {
 					mutex_unlock(&st->lock);
 					return ret;
@@ -254,10 +330,23 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 			if (ret)
 				break;
 
-			*val = MAX31827_16_BIT_TO_M_DGR(uval);
+			if (chip_type == max31875)
+				*val = MAX31875_16_BIT_TO_M_DGR(uval);
+			else
+				*val = MAX31827_16_BIT_TO_M_DGR(uval);
 
 			break;
 		case hwmon_temp_max:
+			if (chip_type == max31875) {
+				ret = regmap_read(st->regmap, MAX31875_TH_REG,
+						  &uval);
+				if (ret)
+					break;
+
+				*val = MAX31875_16_BIT_TO_M_DGR(uval);
+				break;
+			}
+
 			ret = regmap_read(st->regmap, MAX31827_TH_REG, &uval);
 			if (ret)
 				break;
@@ -265,6 +354,17 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = MAX31827_16_BIT_TO_M_DGR(uval);
 			break;
 		case hwmon_temp_max_hyst:
+			if (chip_type == max31875) {
+				ret = regmap_read(st->regmap,
+						  MAX31875_TH_HYST_REG,
+						  &uval);
+				if (ret)
+					break;
+
+				*val = MAX31875_16_BIT_TO_M_DGR(uval);
+				break;
+			}
+
 			ret = regmap_read(st->regmap, MAX31827_TH_HYST_REG,
 					  &uval);
 			if (ret)
@@ -273,8 +373,14 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = MAX31827_16_BIT_TO_M_DGR(uval);
 			break;
 		case hwmon_temp_max_alarm:
-			ret = regmap_read(st->regmap,
-					  MAX31827_CONFIGURATION_REG, &uval);
+			if (chip_type == max31875)
+				ret = regmap_read(st->regmap,
+						  MAX31875_CONFIGURATION_REG,
+						  &uval);
+			else
+				ret = regmap_read(st->regmap,
+						  MAX31827_CONFIGURATION_REG,
+						  &uval);
 			if (ret)
 				break;
 
@@ -314,13 +420,23 @@ static int max31827_read(struct device *dev, enum hwmon_sensor_types type,
 
 	case hwmon_chip:
 		if (attr == hwmon_chip_update_interval) {
-			ret = regmap_read(st->regmap,
-					  MAX31827_CONFIGURATION_REG, &uval);
+			if (chip_type == max31875)
+				ret = regmap_read(st->regmap,
+						  MAX31875_CONFIGURATION_REG,
+						  &uval);
+			else
+				ret = regmap_read(st->regmap,
+						  MAX31827_CONFIGURATION_REG,
+						  &uval);
 			if (ret)
 				break;
 
-			uval = FIELD_GET(MAX31827_CONFIGURATION_CNV_RATE_MASK,
-					 uval);
+			if (chip_type == max31875)
+				uval = FIELD_GET(MAX31875_CONFIGURATION_CNV_RATE_MASK,
+						 uval) + 4;
+			else
+				uval = FIELD_GET(MAX31827_CONFIGURATION_CNV_RATE_MASK,
+						 uval);
 			*val = max31827_conversions[uval];
 		}
 		break;
@@ -337,8 +453,11 @@ static int max31827_write(struct device *dev, enum hwmon_sensor_types type,
 			  u32 attr, int channel, long val)
 {
 	struct max31827_state *st = dev_get_drvdata(dev);
+	enum chips chip_type;
 	int res = 1;
 	int ret;
+
+	chip_type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
 
 	switch (type) {
 	case hwmon_temp:
@@ -356,7 +475,13 @@ static int max31827_write(struct device *dev, enum hwmon_sensor_types type,
 
 			st->enable = val;
 
-			ret = regmap_update_bits(st->regmap,
+			if (chip_type == max31875)
+				ret = regmap_update_bits(st->regmap,
+						 MAX31875_CONFIGURATION_REG,
+						 MAX31875_CONFIGURATION_SHUTDOWN_MASK,
+						 MAX31875_DEVICE_ENABLE(val));
+			else
+				ret = regmap_update_bits(st->regmap,
 						 MAX31827_CONFIGURATION_REG,
 						 MAX31827_CONFIGURATION_1SHOT_MASK |
 						 MAX31827_CONFIGURATION_CNV_RATE_MASK,
@@ -367,9 +492,16 @@ static int max31827_write(struct device *dev, enum hwmon_sensor_types type,
 			return ret;
 
 		case hwmon_temp_max:
+			if (chip_type == max31875)
+				return write_alarm_val(st, MAX31875_TH_REG, val);
+
 			return write_alarm_val(st, MAX31827_TH_REG, val);
 
 		case hwmon_temp_max_hyst:
+			if (chip_type == max31875)
+				return write_alarm_val(st, MAX31875_TH_HYST_REG,
+						       val);
+
 			return write_alarm_val(st, MAX31827_TH_HYST_REG, val);
 
 		case hwmon_temp_min:
@@ -400,19 +532,39 @@ static int max31827_write(struct device *dev, enum hwmon_sensor_types type,
 			if (res == ARRAY_SIZE(max31827_conversions))
 				res = ARRAY_SIZE(max31827_conversions) - 1;
 
-			res = FIELD_PREP(MAX31827_CONFIGURATION_CNV_RATE_MASK,
-					 res);
+			if (chip_type == max31875) {
+				if (res < 4)
+					res = 0;
+				else
+					res = FIELD_PREP(MAX31875_CONFIGURATION_CNV_RATE_MASK,
+							 res - 4);
 
-			ret = regmap_update_bits(st->regmap,
+				ret = regmap_update_bits(st->regmap,
+						 MAX31875_CONFIGURATION_REG,
+						 MAX31875_CONFIGURATION_CNV_RATE_MASK,
+						 res);
+			} else {
+				res = FIELD_PREP(MAX31827_CONFIGURATION_CNV_RATE_MASK,
+						 res);
+
+				ret = regmap_update_bits(st->regmap,
 						 MAX31827_CONFIGURATION_REG,
 						 MAX31827_CONFIGURATION_CNV_RATE_MASK,
 						 res);
+			}
+
 			if (ret)
 				return ret;
 
 			st->update_interval = val;
 			return 0;
 		case hwmon_chip_pec:
+			if (chip_type == max31875)
+				return regmap_update_bits(st->regmap,
+						 MAX31875_CONFIGURATION_REG,
+						 MAX31875_CONFIGURATION_PEC_EN_MASK,
+						 val ? MAX31875_CONFIGURATION_PEC_EN_MASK : 0);
+
 			return regmap_update_bits(st->regmap, MAX31827_CONFIGURATION_REG,
 						  MAX31827_CONFIGURATION_PEC_EN_MASK,
 						  val ? MAX31827_CONFIGURATION_PEC_EN_MASK : 0);
@@ -429,14 +581,23 @@ static ssize_t temp1_resolution_show(struct device *dev,
 				     char *buf)
 {
 	struct max31827_state *st = dev_get_drvdata(dev);
+	enum chips type;
 	unsigned int val;
 	int ret;
 
-	ret = regmap_read(st->regmap, MAX31827_CONFIGURATION_REG, &val);
+	type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
+
+	if (type == max31875)
+		ret = regmap_read(st->regmap, MAX31875_CONFIGURATION_REG, &val);
+	else
+		ret = regmap_read(st->regmap, MAX31827_CONFIGURATION_REG, &val);
 	if (ret)
 		return ret;
 
-	val = FIELD_GET(MAX31827_CONFIGURATION_RESOLUTION_MASK, val);
+	if (type == max31875)
+		val = FIELD_GET(MAX31875_CONFIGURATION_RESOLUTION_MASK, val);
+	else
+		val = FIELD_GET(MAX31827_CONFIGURATION_RESOLUTION_MASK, val);
 
 	return scnprintf(buf, PAGE_SIZE, "%u\n", max31827_resolutions[val]);
 }
@@ -446,9 +607,12 @@ static ssize_t temp1_resolution_store(struct device *dev,
 				      const char *buf, size_t count)
 {
 	struct max31827_state *st = dev_get_drvdata(dev);
+	enum chips type;
 	unsigned int idx = 0;
 	unsigned int val;
 	int ret;
+
+	type = (enum chips)(uintptr_t)device_get_match_data(st->dev);
 
 	ret = kstrtouint(buf, 10, &val);
 	if (ret)
@@ -469,10 +633,16 @@ static ssize_t temp1_resolution_store(struct device *dev,
 
 	st->resolution = idx;
 
-	ret = shutdown_write(st, MAX31827_CONFIGURATION_REG,
-			     MAX31827_CONFIGURATION_RESOLUTION_MASK,
-			     FIELD_PREP(MAX31827_CONFIGURATION_RESOLUTION_MASK,
-					idx));
+	if (type == max31875)
+		ret = shutdown_write(st, MAX31875_CONFIGURATION_REG,
+			MAX31875_CONFIGURATION_RESOLUTION_MASK,
+			FIELD_PREP(MAX31875_CONFIGURATION_RESOLUTION_MASK,
+				   idx));
+	else
+		ret = shutdown_write(st, MAX31827_CONFIGURATION_REG,
+			MAX31827_CONFIGURATION_RESOLUTION_MASK,
+			FIELD_PREP(MAX31827_CONFIGURATION_RESOLUTION_MASK,
+				   idx));
 
 	return ret ? ret : count;
 }
@@ -489,6 +659,7 @@ static const struct i2c_device_id max31827_i2c_ids[] = {
 	{ "max31827", max31827 },
 	{ "max31828", max31828 },
 	{ "max31829", max31829 },
+	{ "max31875", max31875 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, max31827_i2c_ids);
@@ -503,20 +674,33 @@ static int max31827_init_client(struct max31827_state *st,
 	bool prop;
 	int ret;
 
+	type = (enum chips)(uintptr_t)device_get_match_data(dev);
+
 	fwnode = dev_fwnode(dev);
 
 	st->enable = true;
-	res |= MAX31827_DEVICE_ENABLE(1);
+	if (type == max31875)
+		res |= MAX31875_DEVICE_ENABLE(1);
+	else
+		res |= MAX31827_DEVICE_ENABLE(1);
 
-	res |= MAX31827_CONFIGURATION_RESOLUTION_MASK;
+	if (type == max31875)
+		res |= FIELD_PREP(MAX31875_CONFIGURATION_RESOLUTION_MASK,
+				  MAX31827_RES_12_BIT);
+	else
+		res |= MAX31827_CONFIGURATION_RESOLUTION_MASK;
 
 	prop = fwnode_property_read_bool(fwnode, "adi,comp-int");
 	res |= FIELD_PREP(MAX31827_CONFIGURATION_COMP_INT_MASK, prop);
 
 	prop = fwnode_property_read_bool(fwnode, "adi,timeout-enable");
-	res |= FIELD_PREP(MAX31827_CONFIGURATION_TIMEOUT_MASK, !prop);
+	if (type == max31875)
+		res |= FIELD_PREP(MAX31875_CONFIGURATION_TIMEOUT_MASK, !prop);
+	else
+		res |= FIELD_PREP(MAX31827_CONFIGURATION_TIMEOUT_MASK, !prop);
 
-	type = (enum chips)(uintptr_t)device_get_match_data(dev);
+	if (type == max31875)
+		goto skip_alarm_pol;
 
 	if (fwnode_property_present(fwnode, "adi,alarm-pol")) {
 		ret = fwnode_property_read_u32(fwnode, "adi,alarm-pol", &data);
@@ -543,10 +727,18 @@ static int max31827_init_client(struct max31827_state *st,
 		}
 	}
 
+skip_alarm_pol:
 	if (fwnode_property_present(fwnode, "adi,fault-q")) {
 		ret = fwnode_property_read_u32(fwnode, "adi,fault-q", &data);
 		if (ret)
 			return ret;
+
+		/*
+		 * Fault queue of 6 in MAX31875 has the same mapping as 8 in
+		 * MAX31827, MAX31828 and MAX31829.
+		 */
+		if (type == max31875 && data == 6)
+			data = 8;
 
 		/*
 		 * Convert the desired fault queue into register bits.
@@ -574,10 +766,17 @@ static int max31827_init_client(struct max31827_state *st,
 			res |= FIELD_PREP(MAX31827_CONFIGURATION_FLT_Q_MASK,
 					  MAX31827_FLT_Q_4);
 			break;
+		case max31875:
+			res |= FIELD_PREP(MAX31875_CONFIGURATION_FLT_Q_MASK,
+					  MAX31827_FLT_Q_1);
+			break;
 		default:
 			return -EOPNOTSUPP;
 		}
 	}
+
+	if (type == max31875)
+		return regmap_write(st->regmap, MAX31875_CONFIGURATION_REG, res);
 
 	return regmap_write(st->regmap, MAX31827_CONFIGURATION_REG, res);
 }
@@ -585,6 +784,14 @@ static int max31827_init_client(struct max31827_state *st,
 static const struct hwmon_channel_info *max31827_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_ENABLE | HWMON_T_INPUT | HWMON_T_MIN |
 					 HWMON_T_MIN_HYST | HWMON_T_MIN_ALARM |
+					 HWMON_T_MAX | HWMON_T_MAX_HYST |
+					 HWMON_T_MAX_ALARM),
+	HWMON_CHANNEL_INFO(chip, HWMON_C_UPDATE_INTERVAL | HWMON_C_PEC),
+	NULL,
+};
+
+static const struct hwmon_channel_info *max31875_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_ENABLE | HWMON_T_INPUT |
 					 HWMON_T_MAX | HWMON_T_MAX_HYST |
 					 HWMON_T_MAX_ALARM),
 	HWMON_CHANNEL_INFO(chip, HWMON_C_UPDATE_INTERVAL | HWMON_C_PEC),
@@ -602,11 +809,17 @@ static const struct hwmon_chip_info max31827_chip_info = {
 	.info = max31827_info,
 };
 
+static const struct hwmon_chip_info max31875_chip_info = {
+	.ops = &max31827_hwmon_ops,
+	.info = max31875_info,
+};
+
 static int max31827_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct device *hwmon_dev;
 	struct max31827_state *st;
+	enum chips type;
 	int err;
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_WORD_DATA))
@@ -618,7 +831,12 @@ static int max31827_probe(struct i2c_client *client)
 
 	mutex_init(&st->lock);
 
-	st->regmap = devm_regmap_init_i2c(client, &max31827_regmap);
+	type = (enum chips)(uintptr_t)device_get_match_data(dev);
+
+	if (type == max31875)
+		st->regmap = devm_regmap_init_i2c(client, &max31875_regmap);
+	else
+		st->regmap = devm_regmap_init_i2c(client, &max31827_regmap);
 	if (IS_ERR(st->regmap))
 		return dev_err_probe(dev, PTR_ERR(st->regmap),
 				     "Failed to allocate regmap.\n");
@@ -631,9 +849,18 @@ static int max31827_probe(struct i2c_client *client)
 	if (err)
 		return err;
 
-	hwmon_dev = devm_hwmon_device_register_with_info(dev, client->name, st,
-							 &max31827_chip_info,
-							 max31827_groups);
+	st->dev = dev;
+
+	if (type == max31875)
+		hwmon_dev = devm_hwmon_device_register_with_info(dev,
+							client->name, st,
+							&max31875_chip_info,
+							max31827_groups);
+	else
+		hwmon_dev = devm_hwmon_device_register_with_info(dev,
+							client->name, st,
+							&max31827_chip_info,
+							max31827_groups);
 
 	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
@@ -651,6 +878,10 @@ static const struct of_device_id max31827_of_match[] = {
 		.compatible = "adi,max31829",
 		.data = (void *)max31829
 	},
+	{
+		.compatible = "adi,max31875",
+		.data = (void *)max31875
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, max31827_of_match);
@@ -666,6 +897,7 @@ static struct i2c_driver max31827_driver = {
 };
 module_i2c_driver(max31827_driver);
 
+MODULE_AUTHOR("John Erasmus Mari Geronimo <johnerasmusmari.geronimo@analog.com>");
 MODULE_AUTHOR("Daniel Matyas <daniel.matyas@analog.com>");
 MODULE_DESCRIPTION("Maxim MAX31827 low-power temperature switch driver");
 MODULE_LICENSE("GPL");
